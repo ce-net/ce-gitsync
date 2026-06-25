@@ -178,7 +178,10 @@ def recv_announce(msg, peer_nid):
     logline(f"recv announce {rel} <- {peer_name(peer_nid)}: {their_head[:8]}")
     repo = os.path.join(ROOT, rel) if rel != "." else ROOT
     if not os.path.isdir(os.path.join(repo, ".git")):
-        return  # repo doesn't exist here yet; full-clone path is a TODO (rare)
+        # Full-clone over the mesh: this machine doesn't have the repo yet. Init an empty repo here;
+        # the fetch + unborn-branch checkout below populates it from the peer's bundle.
+        os.makedirs(repo, exist_ok=True)
+        git(repo, "init", "-q")
     peer = peer_name(peer_nid)
     try:
         data = base64.b64decode(obj["bundle"]) if "bundle" in obj else blob_get(obj["cid"])
