@@ -10,10 +10,23 @@
 # content-addressed blob store (git bundles) + mesh messaging (announce/ack), peer-id authenticated.
 # No capability needed: git runs locally; the peer is trusted via ce-link enrollment + node-id auth.
 
-import os, sys, json, time, base64, subprocess, binascii, urllib.request, urllib.error, tempfile
+import os, sys, json, time, base64, subprocess, binascii, urllib.request, urllib.error, tempfile, threading
 
 INLINE_MAX = 512 * 1024  # bundles up to this go INLINE in the mesh message (reliable); larger fall
                          # back to the blob store. Git deltas are normally tiny, so inline is the rule.
+
+# Event-driven file watching (fsevents on macOS, inotify on Linux). A full git-status scan of ~70
+# repos is ~10s, so POLLING can never be real-time — the watcher fires the instant a file is saved
+# and we commit+push only the affected repo. Falls back to a slow full-reconcile loop if absent.
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    HAVE_WATCHDOG = True
+except Exception:
+    HAVE_WATCHDOG = False
+
+DIRTY = set()
+DIRTY_LOCK = threading.Lock()
 
 NODE = os.environ.get("CE_NODE", "http://127.0.0.1:8844").rstrip("/")
 ROOT = os.path.expanduser(os.environ.get("CE_GITSYNC_ROOT", "~/ce-net"))
@@ -134,6 +147,42 @@ def auto_commit(repo, branch):
     git(repo, "-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
         "commit", "--no-verify", "-q", "-m", f"live: {HOST} {time.strftime('%Y-%m-%d %H:%M:%S')}")
     return True
+
+# ---- event-driven file watcher -------------------------------------------------------------------
+IGNORE_SEGS = ("/.git/", "/target/", "/target-", "/node_modules/", "/.cargo-shared/", "/.cargo/",
+               "/dist/", "/build/", "/.next/", "/.worktrees/", "/__pycache__/")
+
+def repo_of(path):
+    """Nearest ancestor dir (under ROOT) that is a git repo — i.e. which repo a changed file is in."""
+    p = os.path.abspath(path)
+    root = os.path.abspath(ROOT)
+    while p.startswith(root):
+        if os.path.isdir(os.path.join(p, ".git")):
+            return p
+        if p == root:
+            break
+        p = os.path.dirname(p)
+    return None
+
+if HAVE_WATCHDOG:
+    class _Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            path = getattr(event, "dest_path", "") or event.src_path
+            if any(s in path for s in IGNORE_SEGS):
+                return
+            repo = repo_of(path)
+            if repo:
+                with DIRTY_LOCK:
+                    DIRTY.add(repo)
+
+def start_watcher():
+    if not HAVE_WATCHDOG:
+        return None
+    obs = Observer()
+    obs.schedule(_Handler(), ROOT, recursive=True)
+    obs.daemon = True
+    obs.start()
+    return obs
 
 # ---- log/monitor ---------------------------------------------------------------------------------
 def logline(msg):
@@ -282,15 +331,50 @@ def push_changes(last_pushed):
                 logline(f"push error {os.path.relpath(repo, ROOT)}: {e}")
 
 def cmd_serve():
-    logline(f"ce-gitsync serving as {HOST} over {NODE}; root={ROOT}; peers={[peer_name(p) for p in peer_ids()]}")
-    seen, last_pushed = set(), {}
+    repos0 = git_repos()
+    logline(f"ce-gitsync serving as {HOST}; root={ROOT}; repos={len(repos0)}; "
+            f"watcher={'fsevents/inotify' if HAVE_WATCHDOG else 'POLL'}; peers={[peer_name(p) for p in peer_ids()]}")
+    start_watcher()
+    seen = set()
+    # Initial reconcile: announce every repo's head once so peers full-clone whatever they lack.
+    for repo in repos0:
+        b = cur_branch(repo)
+        if not b: continue
+        try:
+            auto_commit(repo, b)
+            for nid in peer_ids(): push_repo(repo, nid)
+        except Exception as e:
+            logline(f"init {os.path.relpath(repo, ROOT)}: {e}")
+    last_hb = last_scan = time.time()
     while True:
         try:
+            # 1) INSTANT: push only the repos the file-watcher flagged (no full scan).
+            with DIRTY_LOCK:
+                dirty = list(DIRTY); DIRTY.clear()
+            for repo in dirty:
+                b = cur_branch(repo)
+                if b and auto_commit(repo, b):
+                    for nid in peer_ids(): push_repo(repo, nid)
+            # 2) receive incoming announces/acks.
             process_inbox(seen)
-            push_changes(last_pushed)
+            now = time.time()
+            # 3) RELIABLE scan every ~2s: auto-commit + (re)announce every repo. This is the path that
+            #    works even where the fs-watcher is silent (launchd's sandbox blocks fsevents for
+            #    background agents). push_repo no-ops when the peer already has our head, so it also
+            #    serves as the heartbeat that self-heals dropped messages. Cheap for a small repo set;
+            #    for the whole workspace this is why the native (Rust/notify) daemon is needed.
+            if now - last_scan > 2:
+                last_scan = now
+                for repo in git_repos():
+                    b = cur_branch(repo)
+                    if not b: continue
+                    try:
+                        auto_commit(repo, b)
+                        for nid in peer_ids(): push_repo(repo, nid)
+                    except Exception: pass
         except Exception as e:
             logline(f"loop error: {e}")
-        time.sleep(POLL_SEC)
+        time.sleep(0.2 if HAVE_WATCHDOG else 1.0)
 
 def cmd_once():
     seen, last_pushed = set(), {}
