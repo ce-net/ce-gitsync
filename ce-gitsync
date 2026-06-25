@@ -101,9 +101,13 @@ def all_git_repos():
     return out
 
 def git_repos():
+    # Default: sync EVERY git repo under ~/ce-net (the whole workspace). An optional allowlist
+    # (~/.config/ce-gitsync/repos or $CE_GITSYNC_REPOS) restricts to a subset when you want it.
+    repos = all_git_repos()
     allow = repo_allowlist()
-    if not allow: return []
-    return [r for r in all_git_repos() if os.path.relpath(r, ROOT) in allow or r == ROOT and "." in allow]
+    if not allow:
+        return repos
+    return [r for r in repos if os.path.relpath(r, ROOT) in allow or (r == ROOT and "." in allow)]
 
 def cur_branch(repo):
     r = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
