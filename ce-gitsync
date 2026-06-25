@@ -254,7 +254,10 @@ def process_inbox(seen):
     if len(seen) > 4000: seen.clear()
 
 def push_changes(last_pushed):
-    """Auto-commit dirty repos and push any repo whose head advanced."""
+    """Auto-commit dirty repos and (re)announce. Pushes on a head change AND on a ~15s heartbeat, so
+    a dropped announce self-heals — push_repo no-ops when the peer already has our head (peer_ref),
+    and re-sends the delta when it doesn't. No permanent divergence on a missed message."""
+    now = time.time()
     for nid in peer_ids():
         for repo in git_repos():
             branch = cur_branch(repo)
@@ -262,12 +265,12 @@ def push_changes(last_pushed):
             try:
                 auto_commit(repo, branch)
                 h = head(repo)
+                if not h: continue
                 key = (nid, repo)
-                if h and last_pushed.get(key) != h:
-                    base = get_ref(repo, peer_ref(peer_name(nid)))
-                    if base != h:
-                        push_repo(repo, nid)
-                    last_pushed[key] = h
+                prev = last_pushed.get(key)
+                if (not prev) or prev[0] != h or (now - prev[1]) > 15:
+                    push_repo(repo, nid)   # cheap no-op if the peer already acked this head
+                    last_pushed[key] = (h, now)
             except Exception as e:
                 logline(f"push error {os.path.relpath(repo, ROOT)}: {e}")
 
