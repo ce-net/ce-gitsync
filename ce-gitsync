@@ -20,7 +20,7 @@ ROOT = os.path.expanduser(os.environ.get("CE_GITSYNC_ROOT", "~/ce-net"))
 LINKS = os.path.expanduser("~/.config/ce-link/links.json")
 STATE_DIR = os.path.expanduser("~/.config/ce-gitsync")
 LOG_FILE = os.path.join(STATE_DIR, "activity.log")
-POLL_SEC = float(os.environ.get("CE_GITSYNC_POLL", "2"))
+POLL_SEC = float(os.environ.get("CE_GITSYNC_POLL", "0.2"))  # raw mesh RTT is ~0.1s; poll tight to hit it
 HOST = os.environ.get("CE_GITSYNC_HOST", os.uname().nodename.split(".")[0])
 
 # ---- node API (token from the platform data dir, like ce-rs) -------------------------------------
