@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+# ce-gitsync — real-time git sync over the CE mesh (option B). See DESIGN.md.
+#
+#   ce-gitsync serve     run on each machine: auto-commit + exchange commits with the peer, live
+#   ce-gitsync once      one sync pass (commit + push + pull), then exit
+#   ce-gitsync log       show recent sync activity (the monitor)
+#   ce-gitsync status    one-line summary per repo
+#
+# Substrate: git (history, offline-catch-up, recover-anything). Transport: the local CE node's
+# content-addressed blob store (git bundles) + mesh messaging (announce/ack), peer-id authenticated.
+# No capability needed: git runs locally; the peer is trusted via ce-link enrollment + node-id auth.
+
+import os, sys, json, time, base64, subprocess, binascii, urllib.request, urllib.error, tempfile
+
+INLINE_MAX = 512 * 1024  # bundles up to this go INLINE in the mesh message (reliable); larger fall
+                         # back to the blob store. Git deltas are normally tiny, so inline is the rule.
+
+NODE = os.environ.get("CE_NODE", "http://127.0.0.1:8844").rstrip("/")
+ROOT = os.path.expanduser(os.environ.get("CE_GITSYNC_ROOT", "~/ce-net"))
+LINKS = os.path.expanduser("~/.config/ce-link/links.json")
+STATE_DIR = os.path.expanduser("~/.config/ce-gitsync")
+LOG_FILE = os.path.join(STATE_DIR, "activity.log")
+POLL_SEC = float(os.environ.get("CE_GITSYNC_POLL", "2"))
+HOST = os.environ.get("CE_GITSYNC_HOST", os.uname().nodename.split(".")[0])
+
+# ---- node API (token from the platform data dir, like ce-rs) -------------------------------------
+def api_token():
+    t = os.environ.get("CE_API_TOKEN")
+    if t: return t.strip()
+    for p in ("~/Library/Application Support/ce/api.token", "~/.local/share/ce/api.token"):
+        fp = os.path.expanduser(p)
+        if os.path.exists(fp):
+            try: return open(fp).read().strip()
+            except Exception: pass
+    return None
+
+def _req(path, data=None, method="GET", raw=False):
+    h = {}
+    t = api_token()
+    if t: h["Authorization"] = f"Bearer {t}"
+    if data is not None and not raw: h["Content-Type"] = "application/json"
+    body = data if raw else (json.dumps(data).encode() if data is not None else None)
+    r = urllib.request.Request(f"{NODE}/{path}", data=body, headers=h, method=method)
+    return urllib.request.urlopen(r, timeout=30).read()
+
+def blob_put(b: bytes) -> str:
+    return json.loads(_req("blobs", data=b, method="POST", raw=True)).get("hash")
+def blob_get(cid: str, tries=4, delay=1.0) -> bytes:
+    # The mesh blob fetch races DHT propagation (the provider record / chunk may not have reached
+    # this node yet). Retry briefly — same resilience rdev's chunk transfer relies on.
+    last = None
+    for _ in range(tries):
+        try:
+            return _req(f"blobs/{cid}", method="GET")
+        except urllib.error.HTTPError as e:
+            last = e; time.sleep(delay)
+    raise last or RuntimeError("blob_get failed")
+def mesh_send(to, topic, obj):
+    ph = binascii.hexlify(json.dumps(obj).encode()).decode()
+    _req("mesh/send", data={"to": to, "topic": topic, "payload_hex": ph}, method="POST")
+def mesh_inbox():
+    try: return json.loads(_req("mesh/messages"))
+    except Exception: return []
+
+# ---- peer ----------------------------------------------------------------------------------------
+def peers():
+    try: return json.load(open(LINKS))
+    except Exception: return []
+def peer_ids(): return {p["peerNodeId"] for p in peers()}
+def peer_name(nid):
+    for p in peers():
+        if p["peerNodeId"] == nid: return p["peer"]
+    return nid[:8]
+
+# ---- git -----------------------------------------------------------------------------------------
+def git(repo, *args, check=True):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} in {repo}: {r.stderr.strip()}")
+    return r
+
+def repo_allowlist():
+    # Opt-in: only sync repos named here (comma-separated $CE_GITSYNC_REPOS, or one per line in
+    # ~/.config/ce-gitsync/repos). Protects other agents' uncommitted work — we never auto-commit a
+    # repo you didn't list. Empty => sync nothing (status still lists everything).
+    env = os.environ.get("CE_GITSYNC_REPOS")
+    names = []
+    if env: names = [s.strip() for s in env.split(",") if s.strip()]
+    else:
+        cfg = os.path.join(STATE_DIR, "repos")
+        if os.path.exists(cfg):
+            names = [l.strip() for l in open(cfg) if l.strip() and not l.startswith("#")]
+    return set(names)
+
+def all_git_repos():
+    out = []
+    if os.path.isdir(os.path.join(ROOT, ".git")): out.append(ROOT)
+    for name in sorted(os.listdir(ROOT)):
+        d = os.path.join(ROOT, name)
+        if os.path.isdir(os.path.join(d, ".git")): out.append(d)
+    return out
+
+def git_repos():
+    allow = repo_allowlist()
+    if not allow: return []
+    return [r for r in all_git_repos() if os.path.relpath(r, ROOT) in allow or r == ROOT and "." in allow]
+
+def cur_branch(repo):
+    r = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    return r.stdout.strip() or None  # None = detached HEAD; skip those
+
+def head(repo):
+    # --verify --quiet returns empty (not the literal "HEAD") on an unborn branch.
+    r = git(repo, "rev-parse", "--verify", "--quiet", "HEAD", check=False)
+    return r.stdout.strip() or None
+
+def is_dirty(repo):
+    return bool(git(repo, "status", "--porcelain").stdout.strip())
+
+def peer_ref(peer): return f"refs/ce-gitsync/{peer}"
+def get_ref(repo, ref):
+    r = git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
+    return r.stdout.strip() or None
+def set_ref(repo, ref, sha): git(repo, "update-ref", ref, sha)
+
+def auto_commit(repo, branch):
+    if not is_dirty(repo): return False
+    git(repo, "add", "-A")
+    # identity for the auto-commit (don't depend on global git config)
+    git(repo, "-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
+        "commit", "--no-verify", "-q", "-m", f"live: {HOST} {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    return True
+
+# ---- log/monitor ---------------------------------------------------------------------------------
+def logline(msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    with open(LOG_FILE, "a") as f: f.write(line + "\n")
+    sys.stderr.write(line + "\n"); sys.stderr.flush()
+
+# ---- sync core -----------------------------------------------------------------------------------
+def push_repo(repo, peer_nid):
+    """Send commits the peer lacks as a (thin) bundle over the blob store."""
+    branch = cur_branch(repo)
+    if not branch: return
+    h = head(repo)
+    if not h: return
+    rel = os.path.relpath(repo, ROOT)
+    peer = peer_name(peer_nid)
+    base = get_ref(repo, peer_ref(peer))  # last head we know the peer has
+    with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
+        bpath = tf.name
+    try:
+        if base and git(repo, "merge-base", "--is-ancestor", base, "HEAD", check=False).returncode == 0:
+            if base == h: return  # peer already has our head
+            git(repo, "bundle", "create", bpath, f"^{base}", branch)
+        else:
+            git(repo, "bundle", "create", bpath, branch)  # first contact / unrelated: full branch
+        data = open(bpath, "rb").read()
+        ann = {"repo": rel, "branch": branch, "head": h}
+        if len(data) <= INLINE_MAX:
+            ann["bundle"] = base64.b64encode(data).decode()  # inline over the reliable message path
+        else:
+            ann["cid"] = blob_put(data)                       # large: blob store (with recv retry)
+        mesh_send(peer_nid, "gitsync/announce", ann)
+        logline(f"push {rel} -> {peer}: {h[:8]} ({len(data)} B {'inline' if 'bundle' in ann else 'blob'})")
+    finally:
+        try: os.unlink(bpath)
+        except OSError: pass
+
+def recv_announce(msg, peer_nid):
+    obj = json.loads(binascii.unhexlify(msg["payload_hex"]))
+    rel, branch, their_head = obj["repo"], obj["branch"], obj["head"]
+    logline(f"recv announce {rel} <- {peer_name(peer_nid)}: {their_head[:8]}")
+    repo = os.path.join(ROOT, rel) if rel != "." else ROOT
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return  # repo doesn't exist here yet; full-clone path is a TODO (rare)
+    peer = peer_name(peer_nid)
+    try:
+        data = base64.b64decode(obj["bundle"]) if "bundle" in obj else blob_get(obj["cid"])
+    except Exception as e:
+        logline(f"pull {rel} <- {peer}: bundle fetch failed ({e})"); return
+    with tempfile.NamedTemporaryFile(suffix=".bundle", delete=False) as tf:
+        tf.write(data); bpath = tf.name
+    try:
+        incoming = f"refs/ce-gitsync/incoming/{peer}"
+        git(repo, "fetch", "-q", bpath, f"{branch}:{incoming}")
+        set_ref(repo, peer_ref(peer), their_head)  # we now have their head
+        local_head = head(repo)
+        if local_head is None:
+            # Empty/unborn repo (first sync): adopt the peer's branch wholesale, whatever its name
+            # (checked BEFORE the branch-name guard so a fresh repo isn't rejected on a name mismatch).
+            git(repo, "checkout", "-B", branch, incoming, check=False)
+            logline(f"pull {rel} <- {peer}: initialized from {their_head[:8]}")
+        elif cur_branch(repo) != branch:
+            return  # established repo on a different branch; don't cross-merge branches
+        elif local_head == their_head:
+            pass
+        elif git(repo, "merge-base", "--is-ancestor", "HEAD", incoming, check=False).returncode == 0:
+            git(repo, "merge", "--ff-only", incoming)  # clean fast-forward
+            logline(f"pull {rel} <- {peer}: ff to {their_head[:8]}")
+        else:
+            m = git(repo, "-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
+                    "merge", "--no-edit", "-m", f"merge {peer} into {HOST}", incoming, check=False)
+            if m.returncode == 0:
+                logline(f"pull {rel} <- {peer}: merged {their_head[:8]}")
+            else:
+                # Conflict: never block. Abort the worktree merge, keep local; preserve their
+                # commits on a recoverable branch + a loud log line. (Rare when switching machines.)
+                git(repo, "merge", "--abort", check=False)
+                cb = f"ce-gitsync/conflict-{peer}-{time.strftime('%Y%m%d-%H%M%S')}"
+                git(repo, "branch", "-f", cb, incoming, check=False)
+                logline(f"CONFLICT {rel} <- {peer}: kept local; their version on branch {cb} (resolve when you like)")
+    finally:
+        try: os.unlink(bpath)
+        except OSError: pass
+    # Ack our (possibly-new) head so the peer can delta next time.
+    nh = head(repo)
+    if nh: mesh_send(peer_nid, "gitsync/ack", {"repo": rel, "head": nh})
+
+def recv_ack(msg, peer_nid):
+    obj = json.loads(binascii.unhexlify(msg["payload_hex"]))
+    repo = os.path.join(ROOT, obj["repo"]) if obj["repo"] != "." else ROOT
+    if os.path.isdir(os.path.join(repo, ".git")):
+        try: set_ref(repo, peer_ref(peer_name(peer_nid)), obj["head"])
+        except Exception: pass
+
+def process_inbox(seen):
+    allowed = peer_ids()
+    # Keep only the LATEST announce per (peer, repo) — the inbox is a snapshot that accumulates stale
+    # announces; grinding every one (each maybe a blob fetch) backlogs the daemon. Acks process all.
+    latest_ann, others = {}, []
+    for m in mesh_inbox():
+        topic, frm = m.get("topic", ""), m.get("from", "")
+        if frm not in allowed or not topic.startswith("gitsync/"):
+            continue
+        if topic == "gitsync/announce":
+            try: rel = json.loads(binascii.unhexlify(m["payload_hex"]))["repo"]
+            except Exception: continue
+            latest_ann[(frm, rel)] = m  # later entries win
+        else:
+            others.append(m)
+    for m in others + list(latest_ann.values()):
+        frm, topic = m.get("from", ""), m.get("topic", "")
+        mid = (frm, topic, m.get("payload_hex", "")[:48])
+        if mid in seen:
+            continue
+        seen.add(mid)
+        try:
+            if topic == "gitsync/announce": recv_announce(m, frm)
+            elif topic == "gitsync/ack": recv_ack(m, frm)
+        except Exception as e:
+            logline(f"recv error on {topic}: {e}")
+    if len(seen) > 4000: seen.clear()
+
+def push_changes(last_pushed):
+    """Auto-commit dirty repos and push any repo whose head advanced."""
+    for nid in peer_ids():
+        for repo in git_repos():
+            branch = cur_branch(repo)
+            if not branch: continue
+            try:
+                auto_commit(repo, branch)
+                h = head(repo)
+                key = (nid, repo)
+                if h and last_pushed.get(key) != h:
+                    base = get_ref(repo, peer_ref(peer_name(nid)))
+                    if base != h:
+                        push_repo(repo, nid)
+                    last_pushed[key] = h
+            except Exception as e:
+                logline(f"push error {os.path.relpath(repo, ROOT)}: {e}")
+
+def cmd_serve():
+    logline(f"ce-gitsync serving as {HOST} over {NODE}; root={ROOT}; peers={[peer_name(p) for p in peer_ids()]}")
+    seen, last_pushed = set(), {}
+    while True:
+        try:
+            process_inbox(seen)
+            push_changes(last_pushed)
+        except Exception as e:
+            logline(f"loop error: {e}")
+        time.sleep(POLL_SEC)
+
+def cmd_once():
+    seen, last_pushed = set(), {}
+    push_changes(last_pushed)
+    process_inbox(seen)
+    push_changes(last_pushed)
+    print("one pass complete")
+
+def cmd_log():
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            lines = f.readlines()[-40:]
+        sys.stdout.write("".join(lines))
+    else:
+        print("(no activity yet)")
+
+def cmd_status():
+    allow = repo_allowlist()
+    print(f"syncing {len(allow)} repo(s); peers={[peer_name(p) for p in peer_ids()]}")
+    print("  S = synced (in allowlist), * = uncommitted changes")
+    for repo in all_git_repos():
+        rel = os.path.relpath(repo, ROOT)
+        synced = "S" if (rel in allow or (repo == ROOT and "." in allow)) else " "
+        dirty = "*" if is_dirty(repo) else " "
+        b = cur_branch(repo) or "(detached)"
+        h = (head(repo) or "")[:8]
+        print(f"{synced}{dirty} {rel:22} {b:18} {h}")
+
+OPS = {"serve": cmd_serve, "once": cmd_once, "log": cmd_log, "status": cmd_status}
+op = sys.argv[1] if len(sys.argv) > 1 else "status"
+OPS.get(op, cmd_status)()
