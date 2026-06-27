@@ -1,10 +1,12 @@
 # ce-gitsync GitHub guard
 
-**Policy: keep GitHub in sync with local at all times — but cleanly.** Local is the
-source of truth; GitHub must mirror it. Push whenever you have new work. The one thing
-GitHub must never carry is the ce-gitsync `live: ...` WIP snapshot commits — so before
-each push, scrub those out (keep every real commit, tree byte-identical to local HEAD)
-and force-push local over GitHub. The guard below makes "cleanly" automatic.
+**Policy: keep GitHub in sync with local — but cleanly.** Push whenever you have new
+work; don't let GitHub fall behind. The one thing GitHub must never carry is the
+ce-gitsync `live: ...` WIP snapshot commits — so before each push, scrub those out
+(keep every real commit). Then sync the normal way: **`git pull` (merge converging
+work) then `git push`.** GitHub is a shared remote — expect healthy convergence and
+merge it. **Do NOT routinely force-push** (it clobbers others' work); reserve
+`--force` for exceptional recovery. The guard below makes "cleanly" automatic.
 
 ce-gitsync (`rdev gitsync`) syncs every git repo across your machines **over the CE
 mesh + locally only** — it `git add -A && git commit -m "live: <host> ..."` on the
@@ -50,11 +52,17 @@ git push origin <branch>
 real one): rebuild the branch by re-snapshotting each kept (non-gitsync) commit's tree
 onto a fresh linear history — each kept commit's tree already subsumes the WIP snapshots
 before it, so nothing is lost and there are no conflicts. Verify
-`git diff <old-HEAD> <new-HEAD>` is empty, then force-push:
-```
-git push --force origin <branch>        # local is truth; GitHub mirrors it
-```
-Force-push is expected — there is no protected "curated divergence" to preserve.
+`git diff <old-HEAD> <new-HEAD>` is empty before moving the branch.
 
+Then sync normally — pull/merge first, then push:
+```
+git pull --rebase origin <branch>       # converge with what's already on GitHub
+git push origin <branch>
+```
 Either way the pushed range has zero `gitsync@ce-net` commits, so the guard passes with
 no `--no-verify`. (Bypass once, not recommended: `git push --no-verify`.)
+
+**Force-push is NOT routine.** GitHub is shared — other devices/agents push too, so
+expect healthy convergence and resolve it with a normal merge. `git push --force` is
+dangerous (it clobbers their work); use it ONLY for exceptional recovery when a bad
+history reached the remote and the local tree is the agreed source of truth.
