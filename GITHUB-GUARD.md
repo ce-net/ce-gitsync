@@ -1,5 +1,11 @@
 # ce-gitsync GitHub guard
 
+**Policy: keep GitHub in sync with local at all times — but cleanly.** Local is the
+source of truth; GitHub must mirror it. Push whenever you have new work. The one thing
+GitHub must never carry is the ce-gitsync `live: ...` WIP snapshot commits — so before
+each push, scrub those out (keep every real commit, tree byte-identical to local HEAD)
+and force-push local over GitHub. The guard below makes "cleanly" automatic.
+
 ce-gitsync (`rdev gitsync`) syncs every git repo across your machines **over the CE
 mesh + locally only** — it `git add -A && git commit -m "live: <host> ..."` on the
 working branch and ships a delta **git bundle** over the reliable mesh message path
@@ -27,16 +33,28 @@ Installed:
 - via `git config --global init.templateDir ~/.config/git/template` so every future
   `git init` / `git clone` gets it automatically.
 
-## Pushing real work to GitHub
+## Keeping GitHub in sync (cleanly)
 
-Re-author/squash the WIP first so the pushed range has no `gitsync@ce-net` commits,
-e.g.:
+Scrub the `gitsync@ce-net` WIP commits first so the pushed range has none, then push.
+Two cleaning patterns:
 
+**A — WIP only at the tip** (squash everything since the last real commit into one):
 ```
 git reset --soft <last-real-commit>     # or origin/main
 git -c user.name="Leif Rydenfalk" -c user.email="ledamecrydenfalk@gmail.com" \
     commit --author="Leif Rydenfalk <ledamecrydenfalk@gmail.com>" -m "..."
-git push origin main
+git push origin <branch>
 ```
 
-To bypass once (not recommended): `git push --no-verify`.
+**B — WIP interleaved with real commits** (drop only the gitsync commits, keep every
+real one): rebuild the branch by re-snapshotting each kept (non-gitsync) commit's tree
+onto a fresh linear history — each kept commit's tree already subsumes the WIP snapshots
+before it, so nothing is lost and there are no conflicts. Verify
+`git diff <old-HEAD> <new-HEAD>` is empty, then force-push:
+```
+git push --force origin <branch>        # local is truth; GitHub mirrors it
+```
+Force-push is expected — there is no protected "curated divergence" to preserve.
+
+Either way the pushed range has zero `gitsync@ce-net` commits, so the guard passes with
+no `--no-verify`. (Bypass once, not recommended: `git push --no-verify`.)
