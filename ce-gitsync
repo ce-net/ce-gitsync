@@ -1,5 +1,38 @@
 #!/usr/bin/env python3
-# ce-gitsync — real-time git sync over the CE mesh (option B). See DESIGN.md.
+# ce-gitsync — RETIRED 2026-07-29. IT DOES NOT RUN. Do not re-enable it.
+#
+# Leif, 2026-07-29: "make sure ce gitsync never runs agan! it should be disabled for good
+# because its fucking up so much... just let agents handled this stuff by themselves."
+#
+# What it did wrong, on the record:
+#
+#   * It wrote "live: ..." auto-commits into REAL history, interleaved with deliberate ones.
+#     Nobody can squash them out afterwards without rewriting a branch, so the noise is
+#     permanent.
+#   * Its own pre-push guard then refuses to push any branch carrying those commits. On
+#     2026-07-29 that left PLAN with 120 unpushed commits and legal with 4 - work stranded on
+#     one laptop by the very system meant to distribute it, which is the exact failure the
+#     commit-and-push law names.
+#   * It auto-committed whatever was on disk, mid-edit, with a message that says nothing about
+#     WHY. A commit body is meant to carry the reasoning; "live: mac" carries none.
+#   * Agents already commit their own work, and another agent's WIP, deliberately. A second
+#     writer racing them adds conflicts and takes the authorship away.
+#
+# Agents handle their own git from here: commit deliberately, say why, push.
+#
+# The original implementation is kept below so the history and the bundle-over-mesh transport
+# stay readable. It is unreachable.
+
+import sys as _sys
+
+_sys.stderr.write(
+    "ce-gitsync is RETIRED and does not run (Leif, 2026-07-29).\n"
+    "It wrote 'live: ...' auto-commits into real history, then its own pre-push guard\n"
+    "refused to push the branches carrying them - 120 commits stranded in PLAN alone.\n"
+    "Commit your own work deliberately, say why in the body, and push it.\n")
+raise SystemExit(2)
+
+# --- everything below is unreachable ---
 #
 #   ce-gitsync serve     run on each machine: auto-commit + exchange commits with the peer, live
 #   ce-gitsync once      one sync pass (commit + push + pull), then exit
